@@ -1,9 +1,10 @@
 from docassemble.base.util import *
-import requests, json, datetime, re, pypdftk, copy, time, unicodedata
+import requests, datetime, pypdftk, copy, time, unicodedata, re
 from bs4 import BeautifulSoup
 from markdown import markdown
 from dateutil import relativedelta
 from functools import reduce
+from hellosign_sdk import HSClient
 
 # miscutil.py
 
@@ -32,9 +33,16 @@ def mm_dd_yyyy_dateable(arg):
 	except:
 		return False
 
+def iso_8601_dateable(arg):
+	try:
+		datetime.datetime.strptime(primitive_value(arg), '%Y-%m-%d')
+		return True
+	except:
+		return False
+
 def typecast_as_date(_arg):
 	arg = augment(_arg)
-	if is_undefined(arg):
+	if is_undefined(arg) or arg.wrapped == "":
 		return arg
 	return augment(as_datetime(arg.wrapped))
 
@@ -74,6 +82,19 @@ def cl_array_map(myfunc, _myiterable):
 	if is_undefined(myiterable):
 		return myiterable
 	return map(myfunc, myiterable.wrapped)
+
+def cl_array_sort(myfunc, _myiterable, reverse=False):
+	myiterable = augment(_myiterable)
+	if is_undefined(myiterable):
+		return myiterable
+	return sorted(myiterable.wrapped, key=myfunc, reverse=reverse)
+
+def cl_array_excluding_transformed_to_undefined(myfunc, _myiterable):
+	# filters myiterable by excluding members for which myfunc returns undefined
+	myiterable = augment(_myiterable)
+	if is_undefined(myiterable):
+		return myiterable
+	return list(filter(lambda x: is_not_undefined(myfunc(x)), myiterable.wrapped))
 
 def is_list(arg):
 	return type(augment(arg).wrapped) == type([])
@@ -117,6 +138,13 @@ def merge_two_dicts(x, y):
 	z = x.copy()
 	z.update(y)
 	return z
+
+def merge_list_of_dicts(my_list):
+	new_dict = {}
+	for existing_dict in my_list:
+		new_dict.update(existing_dict)
+
+	return new_dict
 
 def markdown_to_plaintext(markdown_string):
 	try:
@@ -186,13 +214,24 @@ def cl_all_variables():
 	define('vars', {})
 	return all_variables()
 
-def oxygenate(a_list):
+def oxygenate(a_list, type_map, rawcontent_value):
 	oxygenated = {}
 	for idx, item in enumerate(a_list):
-		oxygenated[idx] = item
+		oxygenated[idx] = convert_appropriate_values_to_rawcontent(item, type_map, rawcontent_value)
 	return oxygenated
 
-def oxygen_legend(the_vars, type_map, wit_vars, rawcontent_value):
+def convert_appropriate_values_to_rawcontent(item, type_map, rawcontent_value):
+	# item is a dict (member of a loop). need to convert its richtext-type values from markdown to rawcontent
+	output = {}
+	for key, val in item.items():
+		variable_type = type_map[key]
+		if variable_type == 'richtext':
+			output[key] = rawcontent_value(val)
+		else:
+			output[key] = val
+	return output
+
+def oxygen_legend(the_vars, type_map, wit_vars, rawcontent_value, signature_expectations={}):
 	legend = { 'variables': {}, 'lists': {}, 'types': type_map }
 	for var in the_vars:
 		if var in type_map:
@@ -201,19 +240,24 @@ def oxygen_legend(the_vars, type_map, wit_vars, rawcontent_value):
 			elif type_map[var] == 'signature':
 				legend['variables'][var] = { 'type': 'signature', 'value': value(var).url_for(temporary=True, seconds=60) }
 			elif type_map[var] == 'array':
-				legend['lists'][var] = oxygenate(the_vars[var])
+				legend['lists'][var] = oxygenate(the_vars[var], type_map, rawcontent_value)
 			else:
 				legend['variables'][var] = { 'type': type_map[var], 'value': str(the_vars[var]) }
 	for wit_var in wit_vars:
 		legend['variables'][wit_var] = wit_vars[wit_var]
+	for signature_expectation in signature_expectations:
+		legend['variables'][signature_expectation] = signature_expectations[signature_expectation]
 	return legend
 
 def serializably(something):
 	try:
-		json.dumps(something)
-		return something
+		return something.url_for(temporary=True, seconds=120)
 	except:
-		return str(something)
+		try:
+			json.dumps(something)
+			return something
+		except:
+			return str(something)
 
 def clstr(something):
 	if something is None:
@@ -273,10 +317,7 @@ class Augmented(object):
 	def __init__(self, something):
 		self.wrapped = something
 	def __str__(self):
-		if self.wrapped:
-			return str(self.wrapped)
-		else:
-			return ''
+		return clstr(self.wrapped)
 	# array
 	def array_index(self, _arg):
 		arg = augment(_arg)
@@ -394,6 +435,10 @@ class Augmented(object):
 		if is_undefined(self) or is_undefined(arg):
 			return Undefined()
 		return augment(self.wrapped <= arg.wrapped)
+	def number_as_ordinal(self):
+		if is_undefined(self):
+			return Undefined()
+		return augment(make_ordinal(self.wrapped))
 	# string
 	def string_join_with_space(self, _arg):
 		arg = augment(_arg)
@@ -455,6 +500,10 @@ class Augmented(object):
 		if is_undefined(self) or is_undefined(arg):
 			return Undefined()
 		return augment(self.wrapped <= arg.wrapped)
+	def time_as_hh_mm_ampm(self):
+		if is_undefined(self):
+			return Undefined()
+		return augment(format_time(self.wrapped, format='h:mm a'))
 	# date
 	def date_eq(self, _arg):
 		arg = augment(_arg)
@@ -508,6 +557,15 @@ class Augmented(object):
 		if is_undefined(self) or is_undefined(arg):
 			return Undefined()
 		return augment(self.wrapped.get(arg.wrapped))
+	# case
+	def to_uppercase(self):
+		if is_undefined(self):
+			return self
+		return augment(self.wrapped.upper())
+	def to_lowercase(self):
+		if is_undefined(self):
+			return self
+		return augment(self.wrapped.lower())
 
 	def make_clio_contacts_dictionary_access(self, clio_refresh_token):
 		def clio_contacts_dictionary_access(contact_id):
@@ -521,7 +579,7 @@ class Augmented(object):
 			___all_field_values = {}
 			___fields = primitive_value(self).get('fields')
 			for field in ___fields:
-				___all_field_values.update({ field.get('name'): clio_response_getter(___member_response, field.get('attribute_name'), field.get('sub_attribute_name'), field.get('selector'), field.get('mapped_to_custom_field')) })
+				___all_field_values.update({ field.get('name'): clio_response_getter(___member_response, field.get('attribute_name'), field.get('sub_attribute_name'), field.get('selector'), field.get('mapped_to_custom_field'), field.get('picklist_mapping')) })
 			return augment(___all_field_values)
 		return clio_contacts_dictionary_access
 
@@ -537,7 +595,7 @@ class Augmented(object):
 			___all_field_values = {}
 			___fields = primitive_value(self).get('fields')
 			for field in ___fields:
-				___all_field_values.update({ field.get('name'): clio_response_getter(___member_response, field.get('attribute_name'), field.get('sub_attribute_name'), field.get('selector'), field.get('mapped_to_custom_field')) })
+				___all_field_values.update({ field.get('name'): clstr(clio_response_getter(___member_response, field.get('attribute_name'), field.get('sub_attribute_name'), field.get('selector'), field.get('mapped_to_custom_field'), field.get('picklist_mapping'))) })
 			return augment(___all_field_values)
 		return clio_matters_dictionary_access
 
@@ -627,15 +685,15 @@ class Augmented(object):
 	def date_format_ddmmyyyy(self):
 		if is_undefined(self) or is_string(self):
 			return self
-		return augment(format_date(self.wrapped, format='d/M/yyyy'))
+		return augment(format_date(self.wrapped, format='dd/MM/yyyy'))
 	def date_format_mmddyyyy(self):
 		if is_undefined(self) or is_string(self):
 			return self
-		return augment(format_date(self.wrapped, format='M/d/yyyy'))
+		return augment(format_date(self.wrapped, format='MM/dd/yyyy'))
 	def date_format_yyyymmdd(self):
 		if is_undefined(self) or is_string(self):
 			return self
-		return augment(format_date(self.wrapped, format='yyyy/M/d'))
+		return augment(format_date(self.wrapped, format='yyyy/MM/dd'))
 	def date_format_yyyymmddhmstz(self):
 		if is_undefined(self) or is_string(self):
 			return self
@@ -660,6 +718,27 @@ class Augmented(object):
 		if is_undefined(self) or is_string(self):
 			return self
 		return augment(format_date(self.wrapped, format='dd'))
+	def date_format_mm(self):
+		if is_undefined(self) or is_string(self):
+			return self
+		return augment(format_date(self.wrapped, format='MM'))
+	def date_format_day_as_ordinal_and_month(self):
+		if is_undefined(self) or is_string(self):
+			return self
+
+		day_of_month = format_date(self.wrapped, format='d')
+		month_name = format_date(self.wrapped, format='MMMM')
+		day_as_ordinal = make_ordinal(day_of_month)
+
+		return "%s day of %s" % (day_as_ordinal, month_name)
+	def date_format_day_as_ordinal(self):
+		if is_undefined(self) or is_string(self):
+			return self
+
+		day_of_month = format_date(self.wrapped, format='d')
+		day_as_ordinal = make_ordinal(day_of_month)
+
+		return str(day_as_ordinal)
 	def days_since(self, _arg):
 		arg = augment(_arg)
 		if is_undefined(self) or is_undefined(arg) or is_string(arg) or is_string(self):
@@ -695,6 +774,14 @@ class Augmented(object):
 		if is_undefined(self) or (not mm_dd_yyyy_dateable(self.wrapped)):
 			return Undefined()
 		return augment(datetime.datetime.strptime(primitive_value(self.wrapped), '%m/%d/%Y'))
+	def string_as_date_iso_8601(self):
+		if is_undefined(self) or (not iso_8601_dateable(self.wrapped)):
+			return Undefined()
+		return augment(datetime.datetime.strptime(primitive_value(self.wrapped), '%Y-%m-%d'))
+	def string_to_all_caps(self):
+		if is_undefined(self):
+			return Undefined()
+		return augment(self.wrapped.upper())
 	def number_format_decimal_precision(self, _arg):
 		arg = augment(_arg)
 		if is_undefined(self) or is_undefined(arg):
@@ -729,13 +816,18 @@ class Augmented(object):
 		access_code = table_import_dict['access_code']
 		endpoint = table_import_dict['read_endpoint_base']
 		full_request_url = endpoint + '?' + urlencode({ 'table_id': cldb_table_id, 'access_code': access_code, 'key_value': key_value })
-		index_response = requests.get(full_request_url)
-		as_json = index_response.json()
-		success = as_json.get('success')
-		if success:
-			return as_json.get('object')
-		else:
-			return { 'success': False }
+		attempts = 0
+		while attempts < 250:
+			index_response = requests.get(full_request_url)
+			as_json = index_response.json()
+			success = as_json.get('success')
+			if success:
+				return as_json.get('object')
+			elif as_json.get('message') == 'locked':
+				attempts += 1
+				time.sleep(.2)
+			else:
+				return { 'success': False }
 
 # utility functions:
 
@@ -783,14 +875,15 @@ def ternary(condition, true_value, false_value):
 
 # clio.py
 
-def clio_response_getter(response_object, attribute_name, sub_attribute_name, selector, custom_field):
+def clio_response_getter(response_object, attribute_name, sub_attribute_name, selector, custom_field, picklist_mapping={}):
 	if not response_object:
 		raise(Exception("The selection you made didn't match anything found in Clio."))
 	if custom_field:
 		___attribute_object = list(filter(lambda item: (item.get('field_name') == attribute_name), response_object.get('custom_field_values')))
 		if (len(___attribute_object) == 0):
 			return '';
-		return ___attribute_object[0].get('value')
+		value = ___attribute_object[0].get('value')
+		return (picklist_mapping or {}).get(str(value)) or value
 	elif (selector != ''):
 		___attribute_object = list(filter(lambda item: (item.get('name') == selector), response_object.get(attribute_name)))
 		if (len(___attribute_object) == 0):
@@ -822,15 +915,18 @@ def as_cgf_update_params(precursory_grouped_update_params, existing_grouped_fiel
 		if group_key not in ___transformed_params:
 			 ___transformed_params[group_key] = []
 		___objects = precursory_grouped_update_params[group_key]
-		for obj in ___objects:
-			___name = obj.get('name')
-			___match = safe_array_access(list(filter(lambda x: x.get('name') == ___name, existing_grouped_fields[group_key])), 0)
-			if ___match:
-				___new_obj = copy.deepcopy(obj)
-				___new_obj['id'] = ___match.get('id')
-				___transformed_params[group_key] = ___transformed_params[group_key] + [___new_obj]
-			else:
-				___transformed_params[group_key] = ___transformed_params[group_key] + [obj]
+		if type(___objects) == type({}):
+			___transformed_params[group_key] = ___objects
+		else:
+			for obj in ___objects:
+				___name = obj.get('name')
+				___match = safe_array_access(list(filter(lambda x: x.get('name') == ___name, existing_grouped_fields[group_key])), 0)
+				if ___name and ___match:
+					___new_obj = copy.deepcopy(obj)
+					___new_obj['id'] = ___match.get('id')
+					___transformed_params[group_key] = ___transformed_params[group_key] + [___new_obj]
+				else:
+					___transformed_params[group_key] = ___transformed_params[group_key] + [obj]
 	return ___transformed_params
 
 def get_clio_access_token_using_refresh_token(refresh_token):
@@ -947,4 +1043,48 @@ def first_file(file_or_file_list):
 		return file_or_file_list
 
 def strip_quotes(the_string):
-	return (the_string or '').replace('"', '').replace("'", '')
+	return clstr(the_string or '').replace('"', '').replace("'", '')
+
+def fine_timestamp():
+	# timestamp as milliseconds
+	return int(time.time() * 1000)
+
+def clio_webhook_alert_on_failure(response, type, webhook_id, user_email, app_id, error, extra_emails=[]):
+	if not response or ((not isinstance(response, dict)) and response.json().get('error') is not None):
+		send_email(to=(['mikeappell@community.lawyer', 'michael@community.lawyer', 'scott@community.lawyer'] + extra_emails), subject='There was a failed Clio webhook detected', body="""
+			A Clio webhook failed for %s, webhook id %s. It was sent by %s from app id %s. The error was as follows:
+
+			%s
+		"""%(type, webhook_id, user_email, app_id, error))
+
+def remove_undefined_emails_for_clio(email_addresses_array):
+	validated_email_addresses = []
+
+	for address_dict in email_addresses_array:
+		if address_dict['address'] != '' and address_dict['address'] is not None:
+			validated_email_addresses.append(address_dict)
+
+	return validated_email_addresses
+
+def make_ordinal(n):
+	'''
+		see: https://stackoverflow.com/a/50992575/3439498
+
+		Convert an integer into its ordinal representation::
+
+		make_ordinal(0)   => '0th'
+		make_ordinal(3)   => '3rd'
+		make_ordinal(122) => '122nd'
+		make_ordinal(213) => '213th'
+	'''
+	n = int(n)
+	suffix = ['th', 'st', 'nd', 'rd', 'th'][min(n % 10, 4)]
+	if 11 <= (n % 100) <= 13:
+		suffix = 'th'
+	return str(n) + suffix
+
+def get_hellosign_client():
+	return HSClient(api_key=get_config('hellosign key'))
+
+def valid_email(email):
+	return not not re.match('[^@]+@[^@]+\.[^@]+', email)
