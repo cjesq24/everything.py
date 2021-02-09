@@ -1,3 +1,5 @@
+# module required rto run yaml generated script in docassemble
+
 from docassemble.base.util import *
 import requests, datetime, pypdftk, copy, time, unicodedata, re
 from bs4 import BeautifulSoup
